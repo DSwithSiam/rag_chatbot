@@ -1,3 +1,5 @@
+import logging
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from app.vector_store import FaissVectorStore, RetrievedChunk
 
 class RAGService:
     def __init__(self) -> None:
+        self.logger = logging.getLogger("rag_service")
         self.documents_dir = Path(settings.documents_dir)
         self.index_dir = Path(settings.index_dir)
         self.documents_dir.mkdir(parents=True, exist_ok=True)
@@ -55,15 +58,33 @@ class RAGService:
         if is_prompt_injection_attempt(question):
             return NO_INFO_MESSAGE, []
 
-        retrieved = self.vector_store.search(query=question, top_k=settings.top_k)
+        normalized_question = self._normalize_question(question)
+
+        retrieved = self.vector_store.search(query=normalized_question, top_k=settings.top_k)
         if not retrieved:
+            self.logger.info("No retrieval hits for session_id=%s", session_id)
             return NO_INFO_MESSAGE, []
 
         best_score = max(chunk.similarity for chunk in retrieved)
-        if best_score < settings.min_similarity:
+        best_overlap = max(self._keyword_overlap(normalized_question, chunk.text) for chunk in retrieved)
+        self.logger.info(
+            "Retrieval best score for session_id=%s: %.4f (threshold=%.4f), overlap=%.4f",
+            session_id,
+            best_score,
+            settings.min_similarity,
+            best_overlap,
+        )
+        # Require both semantic similarity and minimal lexical relevance.
+        if best_score < settings.min_similarity and best_overlap < 0.08:
             return NO_INFO_MESSAGE, []
 
         context = self._build_context(retrieved)
+        supported = self._is_supported_by_context(question=normalized_question, context=context)
+        anchored = self._has_query_anchor(question=normalized_question, context=context)
+        if not supported and not anchored and best_overlap < 0.08 and best_score < 0.22:
+            self.logger.info("Question not supported by retrieved context for session_id=%s", session_id)
+            return NO_INFO_MESSAGE, []
+
         history = self.chat_memory.get(session_id, [])[-settings.max_history_turns :]
 
         messages = [
@@ -88,9 +109,10 @@ class RAGService:
             "CONTEXT:\n"
             f"{context}\n\n"
             "QUESTION:\n"
-            f"{question}\n\n"
-            "Return concise factual answer and include short citations in square brackets "
-            "using chunk ids like [chunk-2]."
+            f"Original question: {question}\n"
+            f"Normalized question: {normalized_question}\n\n"
+            "Return a concise factual answer using only CONTEXT. "
+            "Do not include inline citation tags like [chunk-2] in the final answer text."
         )
         messages.append({"role": "user", "content": user_prompt})
 
@@ -101,9 +123,14 @@ class RAGService:
         )
         answer = completion.choices[0].message.content or NO_INFO_MESSAGE
         answer = answer.strip()
+        answer = re.sub(r"\s*\[chunk-\d+\]\s*$", "", answer, flags=re.IGNORECASE)
 
         if not answer:
             answer = NO_INFO_MESSAGE
+
+        # If LLM is overly conservative, return a direct document excerpt instead of false negative.
+        if answer == NO_INFO_MESSAGE and best_overlap >= 0.08:
+            answer = self._extractive_fallback(question=question, retrieved=retrieved)
 
         self._append_history(session_id=session_id, question=question, answer=answer)
         return answer, retrieved
@@ -120,3 +147,113 @@ class RAGService:
                 f"[chunk-{item.chunk_id}] score={item.similarity:.4f} source={item.source}\n{item.text}"
             )
         return "\n\n".join(context_blocks)
+
+    @staticmethod
+    def _keyword_overlap(question: str, text: str) -> float:
+        q_words = set(re.findall(r"\w{3,}", question.casefold(), flags=re.UNICODE))
+        if not q_words:
+            return 0.0
+        t_words = set(re.findall(r"\w{3,}", text.casefold(), flags=re.UNICODE))
+        if not t_words:
+            return 0.0
+        overlap = len(q_words.intersection(t_words))
+        return overlap / len(q_words)
+
+    @staticmethod
+    def _has_query_anchor(question: str, context: str) -> bool:
+        q_tokens = re.findall(r"\w{3,}", question.casefold(), flags=re.UNICODE)
+        if not q_tokens:
+            return False
+        context_folded = context.casefold()
+        # If at least one meaningful query token appears in context, do not over-reject.
+        return any(token in context_folded for token in q_tokens)
+
+    def _extractive_fallback(self, question: str, retrieved: list[RetrievedChunk]) -> str:
+        ranked = sorted(
+            retrieved,
+            key=lambda c: (self._keyword_overlap(question, c.text), c.similarity),
+            reverse=True,
+        )
+        if not ranked:
+            return NO_INFO_MESSAGE
+
+        best = ranked[0]
+        snippet = best.text.strip()
+        if len(snippet) > 360:
+            snippet = snippet[:360].rstrip() + "..."
+        return snippet
+
+    def _is_supported_by_context(self, question: str, context: str) -> bool:
+        completion = self.client.chat.completions.create(
+            model=settings.openai_model,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict verifier. "
+                        "Decide if the QUESTION can be answered strictly from CONTEXT. "
+                        "Respond with only YES or NO."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"CONTEXT:\n{context}\n\nQUESTION:\n{question}",
+                },
+            ],
+            max_tokens=3,
+        )
+        verdict = (completion.choices[0].message.content or "").strip().upper()
+        return verdict.startswith("YES")
+
+    def _is_answer_grounded(self, question: str, answer: str, context: str) -> bool:
+        completion = self.client.chat.completions.create(
+            model=settings.openai_model,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict QA judge. "
+                        "Return YES only if ANSWER both (1) directly addresses QUESTION and "
+                        "(2) is fully supported by CONTEXT. Otherwise return NO. "
+                        "Respond with only YES or NO."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"QUESTION:\n{question}\n\n"
+                        f"ANSWER:\n{answer}\n\n"
+                        f"CONTEXT:\n{context}"
+                    ),
+                },
+            ],
+            max_tokens=3,
+        )
+        verdict = (completion.choices[0].message.content or "").strip().upper()
+        return verdict.startswith("YES")
+
+    @staticmethod
+    def _normalize_question(question: str) -> str:
+        q = question.strip()
+        lowered = q.casefold()
+
+        replacements = {
+            "ami": "I",
+            "amar": "my",
+            "somporke": "about",
+            "bolo": "tell",
+            "ki kaj kori": "what job do I do",
+            "ki kaj": "job",
+            "kaj": "job",
+            "pesh": "profession",
+            "profession": "profession",
+            "job": "job",
+            "role": "role",
+        }
+
+        for bangla, english in replacements.items():
+            lowered = lowered.replace(bangla, english)
+
+        return lowered

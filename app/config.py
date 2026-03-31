@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     max_chunk_size: int = 900
     chunk_overlap: int = 120
     top_k: int = 4
-    min_similarity: float = 0.40
+    min_similarity: float = 0.15
     max_history_turns: int = 8
 
     documents_dir: str = "data/documents"
@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
+    log_file: str = "logs/app.log"
 
 
 settings = Settings()

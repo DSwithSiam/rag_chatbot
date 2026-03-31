@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,9 +13,21 @@ from app.rag_service import RAGService
 from app.schemas import ChatRequest, ChatResponse, Citation, HealthResponse, IndexResponse
 
 
+log_path = Path(settings.log_file)
+log_path.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            filename=log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+    ],
 )
 logger = logging.getLogger("rag_api")
 
